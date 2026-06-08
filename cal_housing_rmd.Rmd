@@ -1,0 +1,1016 @@
+---
+title: "Comparative Spatial Modeling for Housing Value Prediction"
+author: "Hilda Ndambuki"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    number_sections: true
+  pdf_document:
+    toc: true
+---
+
+
+# Background
+Predicting real estate values is a classic regression problem, but housing data presents a unique challenge: it is inherently geographic. Traditional statistical models assume that data points are completely independent. Real estate completely breaks this assumption because of spatial dependency (houses close to each other share similar neighborhood amenities, school districts, and economic environments) and spatial heterogeneity (the relationship between variables like income and housing value shifts drastically across different geographic regions).
+
+# Dataset
+
+This project uses the **California Housing dataset**, derived from the 1990 
+U.S. Census. Each observation represents a census block group — the smallest 
+geographical unit for which the Census Bureau publishes sample data — 
+containing between 600 and 3,000 people. The dataset comprises 20,640 
+observations and 9 variables:
+
+| Variable | Description |
+|---|---|
+| `longitude` / `latitude` | Geographic coordinates of the block group centroid |
+| `housing_median_age` | Median age of houses within the block group |
+| `total_rooms` | Total number of rooms across all households |
+| `total_bedrooms` | Total number of bedrooms across all households |
+| `population` | Total population of the block group |
+| `households` | Number of households |
+| `median_income` | Median household income (in tens of thousands USD) |
+| `median_house_value` | **Target** — median house value (USD) |
+
+The raw count variables (`total_rooms`, `total_bedrooms`, `population`) are 
+meaningless in isolation without knowing how many households share them. 
+We therefore engineer per-household ratios — `rooms_per_household`, 
+`bedrooms_per_room`, and `population_per_household` — which carry genuine 
+economic meaning and replace their parent columns in all models.
+
+# Objective
+The primary objective of this project is to model and predict the median_house_value across 20,640 block groups from the California Housing dataset. Using raw geographic coordinates (latitude and longitude), this study evaluates and compares three fundamentally different modeling paradigms to determine which framework handles complex, non-linear spatial data most effectively:
+
+## Parametric Models (Spatial Econometrics): 
+Linear architectures (such as Spatial Error and Spatial Lag models) that use a structured spatial weights matrix (\(W\)) to mathematically isolate neighbor contagion and localized spillover effects.
+
+## Generalized Non-Parametric Regression (GNPR): 
+Scalable Generalized Additive Models (GAMs/BAMs) that map geography as a smooth, continuous mathematical surface using multi-dimensional splines and tensor products.
+
+## Machine Learning (ML) Models: 
+Algorithmic tree-based ensembles (such as Random Forests and XGBoost) that use engineered spatial features, proximity metrics, and coordinate clustering to build localized decision logic.
+
+# Significance
+By benchmarking a rigid parametric framework against flexible non-parametric splines and high-capacity machine learning algorithms, this project highlights the trade-offs between model interpretability (understanding why a location impacts value) and predictive power (achieving the lowest error). The final evaluation will utilize spatial cross-validation to guarantee that the models are judged on their ability to generalize to unseen geographic regions, rather than simply memorizing local neighborhoods.
+
+---
+
+# Setup
+The following packages are used:
+
+- `tidyverse` — for general EDA, data manipulation, and ggplot2 plotting
+- `sf` — for spatial data frames and geographic projections
+- `spdep` — for spatial neighbours and weights matrices
+- `spatialreg` — for parametric spatial models (SAR, SEM, SDM)
+- `mgcv` — for GNPR models (BAM/GAM thin-plate and tensor splines)
+- `tidymodels` — for the Machine Learning framework (recipe, workflow, tune)
+- `ranger` — for fast Random Forest ML models
+- `xgboost` — for Gradient Boosting ML models
+- `spatialsample` — for spatial cross-validation splitting
+- `car` — for multicollinearity checking (VIF)
+- `corrplot` — for exploratory correlation matrix visualisation
+- `patchwork` — for combining EDA plots side-by-side
+- `maps`, `caret`, `here`, `clue` — supporting utilities
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.width = 9, fig.height = 5)
+```
+
+
+```{r packages}
+pkgs <- c(
+  "tidyverse", "sf", "car", "corrplot", "patchwork",
+  "spdep", "spatialreg", "mgcv", "tidymodels",
+  "ranger", "xgboost", "spatialsample",
+  "maps", "caret", "here", "clue",
+  "future", "furrr"
+)
+for (p in pkgs) {
+  if (!requireNamespace(p, quietly = TRUE)) install.packages(p)
+  library(p, character.only = TRUE)
+}
+```
+
+# Load Data
+
+```{r data-loading}
+housing_raw <- read.csv("cal_housing.data", header = FALSE)
+colnames(housing_raw) <- c(
+  "longitude", "latitude", "housing_median_age",
+  "total_rooms", "total_bedrooms", "population",
+  "households", "median_income", "median_house_value"
+)
+dim(housing_raw)
+head(housing_raw)
+```
+
+
+# General Exploratory Data Analysis and Data Preprocessing
+```{r summary}
+summary(housing_raw)
+```
+
+
+```{r missing-values}
+print(colSums(is.na(housing_raw)))
+```
+
+
+```{r distribution of variables}
+# Pivot the data while explicitly excluding coordinates
+data_filt <- housing_raw %>%
+  select(where(is.numeric), -longitude, -latitude) %>% # Keeps numbers, drops lat/long
+  pivot_longer(cols = everything(), names_to = "variable", values_to = "value")
+
+# Generate the distribution grid
+distribution_plots_filtered <- ggplot(data_filt, aes(x = value)) +
+  geom_histogram(bins = 40, fill = "steelblue", color = "white", alpha = 0.8) +
+  facet_wrap(~ variable, scales = "free", ncol = 3) + 
+  labs(
+    title = "Feature Distributions",
+    subtitle = "Analysis of structural skewness and target censoring",
+    x = "Value",
+    y = "Frequency"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    strip.text = element_text(face = "bold", size = 10), 
+    panel.spacing = unit(1.2, "lines"),                  
+    plot.title = element_text(face = "bold", size = 14),
+    axis.text.x = element_text(angle = 45, hjust = 1)   
+  )
+
+# Print the plot grid
+print(distribution_plots_filtered)
+
+```
+
+The distributions confirm two design choices made in preprocessing. `total_rooms`, `total_bedrooms`, `households` and `population` are severely right-skewed raw counts. They are economically meaningless without a household denominator and are hence replaced by per-household ratios. `median_house_value` shows a sharp cliff at \$500,000, which is not a real market ceiling and observations at that value will be removed.
+
+## Outlier Capping
+
+Remove ceiling on `median house value` 
+
+```{r clean-outliers}
+data_clean <- housing_raw %>%
+  filter(median_house_value < 500000)
+```
+
+## Feature Engineering
+Raw totals (rooms, bedrooms, population) are economically meaningless without knowing how many households share them. We replace each raw count with its per-household ratio. The original raw columns are **dropped from all models** — the engineered features supersede them entirely.
+
+```{r feature-engineering}
+data_clean <- data_clean %>%
+  mutate(
+    rooms_per_hh      = total_rooms    / households,
+    bedrooms_per_room = total_bedrooms / total_rooms,
+    pop_per_hh        = population     / households
+  ) %>%
+  select(-total_rooms, -total_bedrooms, -population) %>%
+  filter(bedrooms_per_room <= 1)
+```
+
+## Correlation with target
+```{r corr-plot}
+cor_matrix <- data_clean %>%
+  select(median_house_value, median_income, housing_median_age, rooms_per_hh, bedrooms_per_room, pop_per_hh) %>%
+  as.data.frame() %>% 
+  cor(use = "complete.obs")
+
+corrplot(cor_matrix, method = "color", type = "upper",
+         tl.cex = 0.75, addCoef.col = "black", number.cex = 0.6,
+         title = "Correlation Matrix", mar = c(0, 0, 1, 0))
+
+```
+The correlation matrix shows that `median_income` is the strongest predictor of `median_house_value` (r ≈ 0.65), indicating a moderately strong positive linear relationship. The remaining features (`housing_median_age`, `rooms_per_hh`, `bedrooms_per_room`, `pop_per_hh`) show weak to negligible linear correlations with the target, suggesting the bulk of predictive signal beyond income is non-linear or spatially structured.
+
+
+## Income Effect on Median House Value
+
+Since  `median_income` is the strongest predictor of `median_house_value`, lets see whether they change based on location.
+
+```{r preproc-income-cat}
+data_clean$income_category <- cut(
+  data_clean$median_income,
+  breaks = c(-Inf, 2.5, 4.5, Inf),
+  labels = c("Low", "Medium", "High")
+)
+table(data_clean$income_category)
+```
+
+```{r eda-map-income, fig.height=5}
+ca_counties <- map_data("county") |> subset(region == "california")
+ggplot(data_clean, aes(x = longitude, y = latitude)) +
+  geom_polygon(data = ca_counties, aes(x = long, y = lat, group = group),
+               fill = "gray95", color = "gray70") +
+  geom_point(aes(colour = median_house_value), alpha = 0.3, size = 0.4) +
+  coord_fixed(1.3) +
+  scale_colour_viridis_c(name = "House Value ($)") +
+  facet_wrap(~income_category) +
+  labs(title = "House Values by Location, Faceted by Income Category",
+       x = "Longitude", y = "Latitude") +
+  theme_minimal()
+```
+
+Most Medium and High income earners are concentrated along the coastline while Low income earners are predominantly inland. This geographic income segregation is the first visual signal of spatial non-stationarity. This motivates the spatial modeling frameworks that will follow.
+
+
+# Spatial EDA
+
+**Diagnosing how Geography interacts with median house value**
+
+In this section we will capture spatial elements that are useful in:
+
+- proving that spatial modeling is required
+- confirming spatial non-stationarity, and 
+- identifying directional effects that direct the choice between tensor and isotropic spline
+
+## Spatial Autocorrelation (The clustering check) 
+
+We need to mathematically prove that spatial modeling is required. We will compute Global Moran's I on the target variable median_house_value. A score close to 1 confirms our three-family comparison is fully justified. 
+
+```{r spatial-autocorr}
+# Convert to spatial feature AND project to meters (EPSG:3310)
+eda_sf <- st_as_sf(data_clean, coords = c("longitude", "latitude"), crs = 4326) %>%
+          st_transform(crs = 3310)
+
+# Extract the clean, projected metric coordinates
+eda_coords <- st_coordinates(eda_sf)
+
+# Build a sparse 4-nearest neighbors list based on real metric distance
+eda_knn    <- knearneigh(eda_coords, k = 4)
+eda_nb     <- knn2nb(eda_knn)
+eda_W      <- nb2listw(eda_nb, style = "W")
+
+# Run the Global Moran's I Test
+moran_result <- moran.test(data_clean$median_house_value, eda_W)
+print(moran_result)
+```
+The Moran's I test reveals strong and highly significant positive spatial autocorrelation in `median house values` (\(I = 0.793\), \(z = 169.7\), \(p < 0.000000\)). This indicates that house prices are not randomly distributed, but are instead highly clustered, meaning areas with high home values are significantly surrounded by other high-value areas. Because this violates the assumption of independent observations, spatial modeling techniques should be utilized for subsequent analyses rather than standard ordinary least squares regression. 
+
+## Spatial Heterogeneity & Non-Stationarity (The location value check)
+
+Spatial non-stationarity means a predictor's impact changes depending on where you are. In California, an extra unit of `median_income` might trigger a massive price spike in San Francisco, but have a flat effect in the Central Valley. We can visually test for this by plotting `median_income` against `median_house_value`, but faceting the plot by Inland vs. Coastal zones
+
+```{r spatial-nonstationarity}
+# Create regional dummy buckets based on geography to test for non-stationarity
+data_clean <- data_clean %>%
+  mutate(Region = case_when(
+    (latitude >= 36.25 & latitude <= 38.5) & (longitude < -120)  ~ "Northern/Coastal (Bay Area)",
+    (longitude >= -119.5 & longitude <= -117) & (latitude < 35) ~ "Southern/Coastal (LA/SD)",
+    TRUE                                                         ~ "Inland / Central Valley"
+  ))
+
+# Plot interacting slopes across regions
+ggplot(data_clean, aes(x = median_income, y = median_house_value, color = Region)) +
+  geom_point(alpha = 0.15, size = 0.5) +
+  geom_smooth(method = "lm", formula = y ~ x, se = FALSE, linewidth = 1.2) +
+  labs(
+    title = "Spatial Non-Stationarity with Bounded Coordinates",
+    subtitle = "Comparing the income-to-value relationship across precise boxes",
+    x = "Median Income",
+    y = "Median House Value"
+  ) +
+  scale_color_brewer(palette = "Set1") +
+  theme_minimal() +
+  facet_wrap(~ Region)
+
+```
+There is **severe spatial non-stationarity** because the slope of the regression line changes drastically depending on geographic location. High-income brackets trigger a massive, near-exponential surge in property values within the Northern Coastal Bay Area (blue), whereas the exact same income levels correspond to much lower price ceilings in the Inland Central Valley (red). This disparity demonstrates that a single global linear coefficient for income would fail, mathematically justifying the transition to flexible **GNPR** and Machine Learning frameworks.
+
+## Spatial Anisotropy (The directional check)
+
+Anisotropy means the data behavior changes depending on the direction you move. In California, prices may vary heavily moving East-West (Coast to Mountains), but change smoothly moving North-South (along the Pacific coast). We visualize this spatial distortion clearly using a 2D density contour map overlaid on top of the geographic coordinates.
+
+```{r spatial-anisotropy}
+ggplot(data_clean, aes(x = longitude, y = latitude, z = median_house_value)) +
+  # Plot raw geographic scatter background
+  geom_point(aes(color = median_house_value), alpha = 0.2, size = 0.6) +
+  scale_color_viridis_c(option = "plasma", name = "House Value") +
+  # Overlay statistical contour lines to see the direction of price variance
+  stat_summary_2d(aes(z = median_house_value), fun = mean, bins = 40, alpha = 0.5) +
+  labs(
+    title = "Testing Spatial Anisotropy",
+    subtitle = "Stretched spatial patterns reveal directional pricing trends",
+    x = "Longitude",
+    y = "Latitude"
+  ) +
+  theme_minimal()
+
+```
+This confirms **strong spatial anisotropy** as the housing value gradients stretch long and continuously along a diagonal northwest-to-southeast axis following the California coastline. The price contours drop sharply and compress heavily over very short distances moving inland (eastward), while changing much more gradually moving north-to-south. This directional disparity mathematically proves that spatial relationships are not uniform in all directions, confirming that the GNPR framework will require a **Tensor Product smooth** (`te(longitude, latitude)`) rather than an isotropic spline.
+
+# Spatial Data Partitioning (Train/Test Split)
+
+We cannot use a standard random train/test split. If we do, homes in the test set will sit right next door to homes in the training set, causing severe data leakage and artificially deflating our out-of-sample error metrics.Instead, we will use the `spatialsample` package to partition California into distinct geographic blocks, ensuring our models are tested on their ability to generalize to entirely unseen neighborhoods.
+
+```{r data-partitioning}
+# Convert data to an 'sf' spatial object and project to California Albers (meters)
+cali_spatial <- st_as_sf(data_clean, coords = c("longitude", "latitude"), crs = 4326) %>%
+  st_transform(crs = 3310)
+
+# Extract the projected metric coordinates as numeric X and Y columns
+# This preserves clean spatial features for our ML and GNPR pipelines
+cali_spatial$X <- st_coordinates(cali_spatial)[, 1]
+cali_spatial$Y <- st_coordinates(cali_spatial)[, 2]
+
+# Generate a 10-fold Spatial Block Cross-Validation split using "random" grid assignment
+set.seed(123)
+spatial_folds <- spatial_block_cv(cali_spatial, v = 10, method = "random")
+
+# Fold 1 used for diagnostic fits (OLS, LM tests, AIC comparisons) only.
+# Final evaluation loops over all 10 folds in the cv-loop chunk.
+first_split <- get_rsplit(spatial_folds, 1)
+train_data  <- training(first_split)
+test_data   <- testing(first_split)
+
+cat("10 spatial folds created\n")
+cat("Fold 1 — train:", nrow(train_data), "| test:", nrow(test_data), "\n")
+```
+
+# Parametric Models
+
+We start by building a baseline Ordinary Least Squares (OLS) model. Then, we use Lagrange Multiplier tests to determine whether spatial errors or spatial lags dominate the residuals, and finally, we fit the optimized spatial regressions.
+
+## OLS Baseline.
+
+It serves as the control baseline. Unlike the SAR/SEM/SDM models which handle geography through the weights matrix W, OLS approximates geographic trend using a degree-3 polynomial surface over the projected coordinates giving it a geographic footing without explicit neighbor structure.
+
+
+```{r ols-baseline}
+# Fit the Baseline OLS Model using engineered features
+fit_ols <-  lm(median_house_value ~ median_income + housing_median_age + 
+                  rooms_per_hh + bedrooms_per_room + pop_per_hh + 
+                  poly(X, Y, degree = 3, raw = FALSE), # Creates a curved X/Y pricing surface
+                  data = train_data)
+
+# Check for severe multicollinearity (VIF scores should be < 5)
+print("Variance Inflation Factors (VIF)")
+print(vif(fit_ols))
+
+# View model overview
+summary(fit_ols)
+
+```
+### Spatial Weights Matrix & Lagrange Multiplier Diagnostics
+Next, we construct the `spatial weights matrix` for our training geometry and execute the `Lagrange Multiplier (LM) tests`. These tests mathematically determine if our spatial pattern is caused by `price contagion` (Spatial Lag) or `unobserved local amenities` (Spatial Error).
+
+```{r weights-matrix-LM}
+# Extract projected metric coordinates from the training block
+coords_train <- st_coordinates(train_data)
+
+# Construct a sparse 4-Nearest Neighbors weights matrix (row-standardized)
+knn_train <- knearneigh(coords_train, k = 4)
+nb_train  <- knn2nb(knn_train)
+W_train   <- nb2listw(nb_train, style = "W")
+
+# Execute Classic and Robust Lagrange Multiplier tests
+lm_tests <- lm.LMtests(fit_ols, W_train, test = "all")
+print("Lagrange Multiplier Diagnostics")
+summary(lm_tests)
+
+```
+All scores are highly statistically significant (\(p < 2.2 \times 10^{-16}\)). However, looking at the adjusted diagnostics, which isolate each effect by controlling for the other, the `adjRSlag` statistic (1988.77) is larger than the `adjRSerr` statistic (775.22).This mathematically proves that spatial lag (price contagion) is the dominant spatial process. The market value of a home in California is directly pulled upward or downward by the sale prices of its immediate neighboring properties, rather than just absorbing unobserved neighborhood amenities.
+
+## Spatial Lag Model (SAR) - Confirmed dominant by diagnostics
+Assumes the price of a house is directly influenced by the prices of neighboring houses (spatial spillover).
+
+Equation: \(Y = \rho WY + X\beta + \varepsilon\)
+```{r spatial-lag}
+fit_sar <- lagsarlm(median_house_value ~ median_income + housing_median_age + 
+                    rooms_per_hh + bedrooms_per_room + pop_per_hh, 
+                    data = train_data, listw = W_train, method = "LU")
+```
+
+## Spatial Error Model (SEM)
+Assumes that the spatial dependency is hidden in the error/omitted terms (e.g., quietness, neighborhood prestige) rather than the house price itself.
+
+Equation: \(Y = X\beta + u, \quad u = \lambda Wu + \varepsilon\)
+```{r spatial-error}
+fit_sem <- errorsarlm(median_house_value ~ median_income + housing_median_age + 
+                      rooms_per_hh + bedrooms_per_room + pop_per_hh, 
+                      data = train_data, listw = W_train, method = "LU")
+
+```
+
+## Spatial Durbin Model (SDM)
+
+This is the most robust parametric option since both diagnostics (`RSerr` and `RSlag`) are significant. It assumes a house price is affected by both neighboring house prices and neighboring house characteristics (e.g., if neighboring houses have more rooms, the house price changes). It produces unbiased parameters even if the true underlying data-generating process is a spatial error or lag model.
+
+```{r sdm}
+fit_sdm <- lagsarlm(median_house_value ~ median_income + housing_median_age + 
+                    rooms_per_hh + bedrooms_per_room + pop_per_hh, 
+                    data = train_data, listw = W_train, method = "LU", type = "mixed")
+```
+
+
+### Parametric Models comparison
+
+Lower AIC is Better
+```{r param-models-comparison}
+AIC(fit_ols, fit_sem, fit_sar, fit_sdm)
+```
+
+The baseline OLS model (`fit_ols`) produced the highest AIC among the parametric models, indicating the weakest in-sample fit within this modelling framework. This result suggests that non-spatial specifications are less able to capture the geographic variation present in California housing prices.
+
+Introducing spatial dependence substantially improved model performance. Both the Spatial Error Model (`fit_sem`) and Spatial Lag Model (`fit_sar`) achieved considerably lower AIC values than the baseline OLS model, supporting the earlier Lagrange Multiplier diagnostics that spatial processes play an important role in explaining housing price variation. These improvements indicate that accounting for spatial dependence provides additional explanatory power beyond conventional regression specifications.
+
+Among the parametric approaches, the Spatial Durbin Model (`fit_sdm`) achieved the lowest AIC and therefore the strongest in-sample fit. The superior performance of this model suggests that neighbouring socioeconomic characteristics contribute meaningful information beyond a property's own attributes. By incorporating both local characteristics and spatially lagged covariates, the Spatial Durbin specification captures a broader set of spatial influences affecting housing values.
+
+
+
+# Generalized Non-Parametric Regression (GNPR)
+Instead of treating the entire state with a single global coefficient or a rigid neighbor matrix, these models use flexible mathematical splines to warp a continuous 2D price surface directly over the projected coordinates (`X` and `Y`). This allows the models to naturally handle the raw, un-logged, skewed count variables.
+
+We will use `mgcv::bam()` instead of `mgcv::gam()` for fast, scalable processing.
+
+Standard `gam()` calculates spatial splines using a dense matrix inversion that scales cubically, \(O(N^3)\), where \(N\) is the row count. For our 17,640 training rows, `gam()` forces the computer to execute trillions of internal operations, causing RStudio to hit a memory wall or take hours to run.
+
+`bam()` is explicitly designed for massive datasets (\(N > 10,000\)). By setting discrete = TRUE, it buckets the coordinates into a compact set of unique localized values, dropping the math down to a linear scale, \(O(N)\). It matches the structural output of a standard GAM perfectly but runs in seconds using parallel processing.
+
+Setting k (the number of basis knots) restricts the structural complexity of the geographic curves, preventing it from calculating a knot for every single house.
+
+```{r dataframe-for-models}
+# Run K-Means Clustering to create 'spatial_clusters' feature
+set.seed(123)
+# We cluster using the projected coordinates (X and Y) to ensure accurate metric grouping
+spatial_km <- kmeans(cbind(train_data$X, train_data$Y), centers = 15)
+
+# Append the cluster IDs back to datasets as integers
+train_data$spatial_clusters <- spatial_km$cluster
+
+# Apply the same clustering logic to the test dataset to keep them synced
+# For clean cluster prediction assignment we use library(clue) 
+test_data$spatial_clusters  <- as.integer(clue::cl_predict(spatial_km, cbind(test_data$X, test_data$Y)))
+
+# Convert training data to simple dataframe 
+train_df <- as.data.frame(train_data)
+
+```
+
+
+## Isotropic Splines (Thin-Plate Regression Spline)
+
+This assumes spatial variation behaves uniformly in all geometric directions.
+```{r isotropic-spline}
+fit_gnpr_tp <- bam(median_house_value ~ median_income + housing_median_age + 
+                   rooms_per_hh + bedrooms_per_room + pop_per_hh + 
+                   s(X, Y, bs = "tp", k = 40), 
+                   data = train_df, discrete = TRUE)
+```
+
+
+## Anisotropic Splines (Tensor Product Smooth)
+This allows independent N-S and E-W scaling based on our spatial EDA discoveries.
+
+```{r anisotropic-spline}
+fit_gnpr_te <- bam(median_house_value ~ median_income + housing_median_age + 
+                   rooms_per_hh + bedrooms_per_room + pop_per_hh + 
+                   te(X, Y, k = 20), 
+                   data = train_df, discrete = TRUE)
+```
+
+
+## Geographically Varying Coefficient Model (GVCM)
+It allows the slope of a predictor to warp across space. By specifying `by = median_income` inside the spatial tensor product, we are saying: "Let the economic return of an extra unit of income fluctuate smoothly across latitude and longitude, while accounting for the sharp, elongated price gradients that run along the California coastline."
+
+```{r gvcm}
+fit_gnpr_tensor_gvcm <- bam(median_house_value ~ housing_median_age + rooms_per_hh + 
+                            bedrooms_per_room + pop_per_hh + 
+                            te(X, Y, by = median_income, k = 20), 
+                            data = train_df, discrete = TRUE)
+
+```
+
+### Visualising the Income × Location Interaction
+```{r income-loc}
+plot(fit_gnpr_tensor_gvcm, pages = 1)
+```
+
+The marginal effect of income varies substantially across California. Income exerts a stronger positive effect in coastal regions than inland areas, indicating a nonlinear spatial interaction between wealth and location.
+
+## Hybrid Spatial Lag of Predictor (SLX) on Anisotropic Spline
+Here we calculate the spatial lag of median_income (the average income of the surrounding neighborhood) using the training weights. This captures the contextual neighborhood environment and bridges the gap between parametric and GNPR models. The anisotropic tensor product spline (te(X, Y)) cleanly maps the smooth, large-scale macro-coastal terrain, while the exogenous neighbor-income feature injects immediate local contextual spillover effects.
+
+```{r slx}
+# Calculate the neighbor-income average 
+train_df$neighbor_income <- lag.listw(W_train, train_df$median_income)
+
+# Feed this neighborhood contextual feature into the GNPR model
+fit_gnpr_slx <- bam(median_house_value ~ neighbor_income + median_income + 
+                    housing_median_age + rooms_per_hh + bedrooms_per_room + pop_per_hh + 
+                    te(X, Y, k = 20), 
+                    data = train_df, discrete = TRUE)
+```
+
+## Spatial Adaptive Markov Random Field (MRF) Model
+Using an MRF spline basis (`bs = "mrf"`) provides a way to improve the GNPR track by modifying the underlying mathematical structure of the coordinate space. Rather than relying on continuous metric distances, it acts exactly like a parametric spatial weights matrix (\(W\)) integrated directly inside a non-parametric modeling framework. 
+
+While standard continuous tensors (te(X,Y)) force spatial variations to change smoothly over physical space, real estate prices often drop or surge instantly across distinct neighborhood boundaries, such as a school district border or city limit. Because continuous surfaces cannot handle these sharp, localized geometric cliffs, an MRF discretizes geography into regional neighborhood zones. By utilizing the discrete region smooth s(region_id, bs = "mrf", xt = list(nb = cluster_nb)), the model constructs a penalty matrix based directly on which specific zones share a physical border. Thhis allows for sharp, instant price drops across disconnected boundaries.
+
+```{r mrf}
+# MRF requires a discrete neighbourhood graph over K-Means cluster centroids.
+# This diagnostic fit uses train_df from fold 1 only.
+# The same setup is reproduced automatically inside fit_all_models() for every CV fold.
+
+train_df$region_id <- as.factor(paste0("cluster_", train_df$spatial_clusters))
+
+cluster_summary <- train_df %>%
+  group_by(spatial_clusters) %>%
+  summarise(X = mean(X), Y = mean(Y), .groups = "drop") %>%
+  arrange(spatial_clusters)
+
+cluster_nb   <- tri2nb(as.matrix(cluster_summary[, c("X", "Y")]))
+active_names <- paste0("cluster_", cluster_summary$spatial_clusters)
+attr(cluster_nb, "region.id") <- active_names
+names(cluster_nb)              <- active_names
+train_df$region_id <- factor(train_df$region_id, levels = active_names)
+
+fit_gnpr_mrf <- bam(
+  median_house_value ~ median_income + housing_median_age +
+    rooms_per_hh + bedrooms_per_room + pop_per_hh +
+    s(region_id, bs = "mrf", xt = list(nb = cluster_nb)),
+  data = train_df, discrete = TRUE
+)
+```
+
+
+### GNPR Models comparison
+
+Lower AIC is better
+
+```{r gnpr-models-results}
+AIC(fit_gnpr_tp, fit_gnpr_te, fit_gnpr_tensor_gvcm, fit_gnpr_slx, fit_gnpr_mrf)
+```
+The baseline tensor product smooth (`fit_gnpr_te`) achieved a lower AIC than the isotropic thin-plate spline (`fit_gnpr_tp`), suggesting that allowing directional flexibility in the spatial surface provides a better representation of California's housing market structure. This result is consistent with the spatial anisotropy observed during the exploratory analysis.
+
+Among the GNPR models, the Spatial Durbin Additive Model (`fit_gnpr_slx`) achieved the lowest AIC, indicating the strongest in-sample fit within the non-parametric framework. The inclusion of a neighbourhood-income lag appears to provide additional local socioeconomic context beyond that captured by the smooth spatial surface alone.
+
+The Spatial Adaptive Markov Random Field Model (`fit_gnpr_mrf`) produced the highest AIC among the GNPR approaches. While the discrete spatial structure captured broad neighbourhood connectivity patterns, the use of fixed regional clusters may have limited the model's ability to represent continuous spatial variation across California.
+
+Despite being the strongest-performing GNPR model in terms of AIC, the Hybrid SLX specification did not surpass the best-performing parametric spatial econometric models. These findings suggest that explicitly modelling neighbourhood dependence through spatial interaction structures may provide additional explanatory power beyond flexible spatial smoothing alone.
+
+# Model Evaluation Framework
+
+The following three functions define the full evaluation pipeline. Its for fitting all models on a training block, generating out-of-sample predictions, and computing performance metrics. They are defined here once and called inside the parallel CV loop below.
+
+## Evaluation Function
+```{r evaluate-model}
+evaluate_model <- function(predictions, actual, listw, model_name) {
+  preds     <- as.vector(predictions)
+  resids    <- actual - preds
+  rmse      <- sqrt(mean(resids^2))
+  mae       <- mean(abs(resids))
+  r2        <- 1 - sum(resids^2) / sum((actual - mean(actual))^2)
+  mc        <- moran.test(resids, listw)
+  tibble(
+    Model            = model_name,
+    RMSE             = round(rmse,            2),
+    MAE              = round(mae,             2),
+    R2               = round(r2,              4),
+    Residual_Moran_I = round(mc$estimate[1],  4),
+    Moran_p          = round(mc$p.value,      4)
+  )
+}
+```
+
+## Model fitting function
+```{r fit-models}
+# fit_all_models 
+fit_all_models <- function(train_sf, best_rf_params, best_xgb_params) {
+  
+  train_df  <- as.data.frame(train_sf)
+  n_cores   <- parallel::detectCores()
+  
+  # Spatial weights
+  W_tr <- nb2listw(
+    knn2nb(knearneigh(st_coordinates(train_sf), k = 4)),
+    style = "W"
+  )
+  
+  # K-Means clusters
+  set.seed(123)
+  spatial_km                <- kmeans(cbind(train_df$X, train_df$Y), centers = 15)
+  train_df$spatial_clusters <- spatial_km$cluster
+  train_df$region_id        <- as.factor(paste0("cluster_", spatial_km$cluster))
+  
+  # Parametric 
+  # OLS uses poly(X,Y) as a coordinate trend surface.
+  # SAR/SEM/SDM intentionally omit X/Y — geography is handled through W.
+  fit_ols <- lm(
+    median_house_value ~ median_income + housing_median_age +
+      rooms_per_hh + bedrooms_per_room + pop_per_hh +
+      poly(X, Y, degree = 3, raw = FALSE),
+    data = train_df
+  )
+  fit_sar <- lagsarlm(
+    median_house_value ~ median_income + housing_median_age +
+      rooms_per_hh + bedrooms_per_room + pop_per_hh,
+    data = train_df, listw = W_tr, method = "LU"
+  )
+  fit_sem <- errorsarlm(
+    median_house_value ~ median_income + housing_median_age +
+      rooms_per_hh + bedrooms_per_room + pop_per_hh,
+    data = train_df, listw = W_tr, method = "LU"
+  )
+  fit_sdm <- lagsarlm(
+    median_house_value ~ median_income + housing_median_age +
+      rooms_per_hh + bedrooms_per_room + pop_per_hh,
+    data = train_df, listw = W_tr, method = "LU", type = "mixed"
+  )
+  
+  #  GNPR 
+  fit_tp <- bam(
+    median_house_value ~ median_income + housing_median_age +
+      rooms_per_hh + bedrooms_per_room + pop_per_hh +
+      s(X, Y, bs = "tp", k = 40),
+    data = train_df, discrete = TRUE, nthreads = n_cores
+  )
+  fit_te <- bam(
+    median_house_value ~ median_income + housing_median_age +
+      rooms_per_hh + bedrooms_per_room + pop_per_hh +
+      te(X, Y, k = 20),
+    data = train_df, discrete = TRUE, nthreads = n_cores
+  )
+  fit_gvcm <- bam(
+    median_house_value ~ housing_median_age + rooms_per_hh +
+      bedrooms_per_room + pop_per_hh +
+      te(X, Y, by = median_income, k = 20),
+    data = train_df, discrete = TRUE, nthreads = n_cores
+  )
+  train_df$neighbor_income <- lag.listw(W_tr, train_df$median_income)
+  fit_slx <- bam(
+    median_house_value ~ neighbor_income + median_income + housing_median_age +
+      rooms_per_hh + bedrooms_per_room + pop_per_hh +
+      te(X, Y, k = 20),
+    data = train_df, discrete = TRUE, nthreads = n_cores
+  )
+  
+  # MRF
+  cluster_summary <- train_df %>%
+    group_by(spatial_clusters) %>%
+    summarise(X = mean(X), Y = mean(Y), .groups = "drop") %>%
+    arrange(spatial_clusters)
+  cluster_nb   <- tri2nb(as.matrix(cluster_summary[, c("X", "Y")]))
+  active_names <- paste0("cluster_", cluster_summary$spatial_clusters)
+  attr(cluster_nb, "region.id") <- active_names
+  names(cluster_nb)              <- active_names
+  train_df$region_id <- factor(train_df$region_id, levels = active_names)
+  
+  fit_mrf <- bam(
+    median_house_value ~ median_income + housing_median_age +
+      rooms_per_hh + bedrooms_per_room + pop_per_hh +
+      s(region_id, bs = "mrf", xt = list(nb = cluster_nb)),
+    data = train_df, discrete = TRUE, nthreads = n_cores
+  )
+  
+  #  ML 
+  # fixed params, no tuning inside the fold 
+  train_sf_ml                  <- train_sf
+  train_sf_ml$spatial_clusters <- as.factor(spatial_km$cluster)
+  
+  ml_recipe <- recipe(
+    median_house_value ~ median_income + housing_median_age +
+      rooms_per_hh + bedrooms_per_room + pop_per_hh + X + Y + spatial_clusters,
+    data = as.data.frame(train_sf_ml)
+  ) %>%
+    step_mutate(spatial_clusters = as.factor(spatial_clusters)) %>%
+    step_dummy(spatial_clusters)
+  
+  fit_rf <- fit(
+    workflow() %>% add_recipe(ml_recipe) %>%
+      add_model(finalize_model(
+        rand_forest(trees = 500, mtry = tune(), min_n = tune()) %>%
+          set_engine("ranger", num.threads = n_cores, importance = "impurity") %>%
+          set_mode("regression"),
+        best_rf_params
+      )),
+    data = as.data.frame(train_sf_ml)
+  )
+  fit_xgb <- fit(
+    workflow() %>% add_recipe(ml_recipe) %>%
+      add_model(finalize_model(
+        boost_tree(trees = tune(), tree_depth = tune(), learn_rate = tune()) %>%
+          set_engine("xgboost", nthread = n_cores) %>%
+          set_mode("regression"),
+        best_xgb_params
+      )),
+    data = as.data.frame(train_sf_ml)
+  )
+  
+  # Return everything needed for prediction
+  list(
+    fit_ols = fit_ols, fit_sar = fit_sar, fit_sem = fit_sem, fit_sdm = fit_sdm,
+    fit_tp  = fit_tp,  fit_te  = fit_te,  fit_gvcm = fit_gvcm,
+    fit_slx = fit_slx, fit_mrf = fit_mrf,
+    fit_rf  = fit_rf,  fit_xgb = fit_xgb,
+    W_tr         = W_tr,
+    spatial_km   = spatial_km,
+    active_names = active_names,
+    cluster_nb   = cluster_nb
+  )
+}
+
+```
+
+## Prediction function
+```{r predict-all-models}
+predict_all <- function(models, test_sf) {
+  
+  test_df <- as.data.frame(test_sf)
+  
+  # Test spatial weights
+  W_te <- nb2listw(
+    knn2nb(knearneigh(st_coordinates(test_sf), k = 4)),
+    style = "W"
+  )
+  
+  # Sync clusters from training K-Means to test points
+  test_df$spatial_clusters <- as.integer(
+    clue::cl_predict(models$spatial_km, cbind(test_df$X, test_df$Y))
+  )
+  test_df$region_id <- factor(
+    paste0("cluster_", test_df$spatial_clusters),
+    levels = models$active_names
+  )
+  test_df$neighbor_income <- lag.listw(W_te, test_df$median_income)
+  
+  # Manual coefficient extraction for spatial models — avoids test-side W leakage
+  vars <- c("median_income", "housing_median_age",
+            "rooms_per_hh", "bedrooms_per_room", "pop_per_hh")
+  coef_pred <- function(fit) {
+    as.vector(
+      rowSums(sapply(vars, function(v) test_df[[v]] * fit$coefficients[v])) +
+        fit$coefficients["(Intercept)"]
+    )
+  }
+  
+  # ML test data needs cluster as factor for the recipe
+  test_sf_ml                  <- test_sf
+  test_sf_ml$spatial_clusters <- as.factor(test_df$spatial_clusters)
+  
+  list(
+    pred_ols  = predict(models$fit_ols,  newdata = test_df),
+    pred_sem  = coef_pred(models$fit_sem),
+    pred_sar  = coef_pred(models$fit_sar),
+    pred_sdm  = coef_pred(models$fit_sdm),
+    pred_tp   = predict(models$fit_tp,   newdata = test_df),
+    pred_te   = predict(models$fit_te,   newdata = test_df),
+    pred_gvcm = predict(models$fit_gvcm, newdata = test_df),
+    pred_slx  = predict(models$fit_slx,  newdata = test_df),
+    pred_mrf  = predict(models$fit_mrf,  newdata = test_df),
+    pred_rf   = predict(models$fit_rf,   new_data = test_sf_ml)$.pred,
+    pred_xgb  = predict(models$fit_xgb,  new_data = test_sf_ml)$.pred,
+    W_te      = W_te,
+    test_df   = test_df
+  )
+}
+```
+
+
+# Machine Learning
+
+Tree-based models like Random Forests and XGBoost cut data using strict vertical and horizontal logic gates. This can make them struggle to capture continuous diagonal paths like the California coastline. They will use tidymodels with K-Means spatial cluster IDs.
+
+Hyperparameters are tuned once via spatial CV before the fold loop.
+
+## ML tuning loop
+
+```{r ml-tune}
+set.seed(123)
+global_km <- kmeans(cbind(cali_spatial$X, cali_spatial$Y), centers = 15)
+cali_spatial$spatial_clusters <- global_km$cluster
+
+tune_folds <- spatial_block_cv(cali_spatial, v = 3, method = "random")
+ml_rec <- recipe(
+  median_house_value ~ median_income + housing_median_age +
+    rooms_per_hh + bedrooms_per_room + pop_per_hh + X + Y + spatial_clusters,
+  data = as.data.frame(cali_spatial)
+) %>%
+  step_mutate(spatial_clusters = as.factor(spatial_clusters)) %>%
+  step_dummy(spatial_clusters)
+
+best_params <- list(
+  best_rf = select_best(
+    tune_grid(
+      workflow() %>% add_recipe(ml_rec) %>%
+        add_model(rand_forest(trees = 500, mtry = tune(), min_n = tune()) %>%
+                    set_engine("ranger",
+                               num.threads = parallel::detectCores(),
+                               importance  = "impurity") %>%
+                    set_mode("regression")),
+      resamples = tune_folds,
+      grid      = grid_regular(mtry(range = c(2,6)),
+                               min_n(range = c(5,20)), levels = 3),
+      metrics   = metric_set(rmse)
+    ), metric = "rmse"),
+  best_xgb = select_best(
+    tune_grid(
+      workflow() %>% add_recipe(ml_rec) %>%
+        add_model(boost_tree(trees = tune(), tree_depth = tune(),
+                             learn_rate = tune()) %>%
+                    set_engine("xgboost", nthread = parallel::detectCores()) %>%
+                    set_mode("regression")),
+      resamples = tune_folds,
+      grid      = grid_regular(trees(range      = c(200,500)),
+                               tree_depth(range = c(4,8)),
+                               learn_rate(range = c(-2,-1)), levels = 3),
+      metrics   = metric_set(rmse)
+    ), metric = "rmse")
+)
+```
+
+# All models Evaluation and Performance
+## Cross validation evaluation loop
+
+```{r cv-loop, cache=TRUE}
+
+plan(multisession, workers = max(1, parallel::detectCores() - 1))
+
+fold_results <- future_map(
+  seq_len(nrow(spatial_folds)),
+  function(i) {
+    s <- get_rsplit(spatial_folds, i)
+    m <- fit_all_models(training(s), best_params$best_rf, best_params$best_xgb)
+    p <- predict_all(m, testing(s))
+    actual_i <- p$test_df$median_house_value
+    bind_rows(
+      evaluate_model(p$pred_ols,  actual_i, p$W_te, "Parametric: Baseline OLS"),
+      evaluate_model(p$pred_sem,  actual_i, p$W_te, "Parametric: Spatial Error (SEM)"),
+      evaluate_model(p$pred_sar,  actual_i, p$W_te, "Parametric: Spatial Lag (SAR)"),
+      evaluate_model(p$pred_sdm,  actual_i, p$W_te, "Parametric: Spatial Durbin (SDM)"),
+      evaluate_model(p$pred_tp,   actual_i, p$W_te, "GNPR: Isotropic Spline (Thin-Plate)"),
+      evaluate_model(p$pred_te,   actual_i, p$W_te, "GNPR: Anisotropic Tensor Product"),
+      evaluate_model(p$pred_gvcm, actual_i, p$W_te, "GNPR: Tensor GVCM"),
+      evaluate_model(p$pred_slx,  actual_i, p$W_te, "GNPR: Hybrid SLX"),
+      evaluate_model(p$pred_mrf,  actual_i, p$W_te, "GNPR: Spatial Adaptive MRF"),
+      evaluate_model(p$pred_rf,   actual_i, p$W_te, "ML Ensemble: Random Forest"),
+      evaluate_model(p$pred_xgb,  actual_i, p$W_te, "ML Ensemble: XGBoost")
+    ) %>% mutate(Fold = i)
+  },
+  .options = furrr_options(seed = TRUE)
+)
+plan(sequential)
+all_fold_results <- bind_rows(fold_results)
+
+```
+
+## Models Performance
+```{r leaderboard}
+master_leaderboard <- all_fold_results %>%
+  group_by(Model) %>%
+  summarise(
+    Mean_RMSE   = round(mean(RMSE), 2),
+    SD_RMSE     = round(sd(RMSE),   2),
+    Mean_MAE    = round(mean(MAE),  2),
+    Mean_R2     = round(mean(R2),   4),
+    Mean_MoranI = round(mean(Residual_Moran_I), 4),
+    Mean_MoranP = round(mean(Moran_p), 4),
+    .groups = "drop"
+  ) %>%
+  arrange(Mean_RMSE)
+print(master_leaderboard)
+```
+
+
+```{r fold1-save}
+fold1_preds <- local({
+  s <- get_rsplit(spatial_folds, 1)
+  m <- fit_all_models(training(s), best_params$best_rf, best_params$best_xgb)
+  p <- predict_all(m, testing(s))
+  p$models <- m
+  p
+})
+```
+
+# Results and Discussion
+
+```{r results-inline, include=FALSE}
+best_rmse <- master_leaderboard$Mean_RMSE[1]
+best_sd   <- master_leaderboard$SD_RMSE[1]
+best_r2   <- master_leaderboard$Mean_R2[1]
+xgb_rmse  <- master_leaderboard$Mean_RMSE[master_leaderboard$Model == "ML Ensemble: XGBoost"]
+ols_rmse  <- master_leaderboard$Mean_RMSE[master_leaderboard$Model == "Parametric: Baseline OLS"]
+ols_r2    <- master_leaderboard$Mean_R2[master_leaderboard$Model   == "Parametric: Baseline OLS"]
+gvcm_rmse <- master_leaderboard$Mean_RMSE[master_leaderboard$Model == "GNPR: Tensor GVCM"]
+
+```
+
+**Machine Learning Models.** XGBoost achieved the lowest mean RMSE of $`r format(xgb_rmse, big.mark=",")` across the 10 spatial cross-validation folds, making it the most accurate predictive model in this study. Random Forest ranked second with a mean RMSE of $`r format(best_rmse, big.mark=",")` (SD = $`r format(best_sd, big.mark=",")`) and an average R² of `r best_r2`. The superior performance of both ensemble methods indicates that nonlinear machine learning approaches are better able to capture the complex relationships underlying California housing prices than either parametric or GNPR models. Their ability to model nonlinear effects and higher-order interactions without requiring explicit specification appears particularly advantageous under spatial holdout validation.
+
+**GNPR Models.** Among the GNPR approaches, the Thin-Plate Isotropic Spline achieved the strongest out-of-sample predictive performance. Notably, this differed from the fold-1 AIC ranking, which favoured the Hybrid SLX model. This contrast highlights the distinction between in-sample model fit and out-of-sample predictive accuracy. While the Hybrid SLX model achieved a favourable AIC, its performance was not consistently maintained across geographically distinct validation folds. The Thin-Plate Spline therefore emerged as the most robust GNPR approach under spatial cross-validation.
+
+**Parametric Models.** The parametric spatial econometric models achieved substantially lower predictive performance than both GNPR and machine learning approaches. In particular, the SAR and SDM models produced negative average R² values (`r master_leaderboard$Mean_R2[master_leaderboard$Model == "Parametric: Spatial Lag (SAR)"]` and `r master_leaderboard$Mean_R2[master_leaderboard$Model == "Parametric: Spatial Durbin (SDM)"]`, respectively), indicating poorer predictive performance than a baseline model using the mean response. These findings suggest that models relying heavily on spatial lag structures may experience difficulties generalising to previously unseen geographic regions under spatial holdout validation. In contrast, models that directly learn nonlinear relationships between housing characteristics, income, and location demonstrated greater predictive robustness.
+
+
+
+## RMSE Distribution Across Folds
+
+```{r rmse-boxplot, fig.height=6}
+# Reorder models by median RMSE for cleaner visual ranking
+model_order <- master_leaderboard$Model
+
+ggplot(all_fold_results,
+       aes(x = RMSE, y = factor(Model, levels = rev(model_order)), fill = Model)) +
+  geom_boxplot(show.legend = FALSE, alpha = 0.75) +
+  geom_jitter(width = 0, height = 0.15, alpha = 0.5, size = 1.5) +
+  labs(
+    title = "RMSE Distribution Across 10 Spatial Folds",
+    subtitle = "Each dot = one geographic holdout block; width shows stability",
+    x = "RMSE (USD)", y = NULL
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+The boxplot communicates ranking and stability. The ML models sit furthest left with the tightest boxes, meaning Random Forest and XGBoost are not only the most accurate but the most consistent across different geographic holdouts. The middle pack of Thin-Plate Spline, OLS, and MRF compete closely in median error but show wider spread, reflecting sensitivity to which California region is held out. SAR and SDM are visually detached from the rest of the field entirely with SDM showing the widest spread of any model. They do not just fail badly on average, they also fail unpredictably, which is the geographic holdout collapse made visible.
+
+## Spatial Residual Maps
+
+We map signed residuals (actual − predicted) for the best model in each family onto the California coordinate space. Systematic spatial patterns in the residuals reveal *where* each model fails and this information is invisible in a leaderboard table.
+
+```{r residual-maps, fig.height=8}
+# Reuse fold 1 predictions saved from the CV loop
+test_df_f1    <- fold1_preds$test_df
+test_coords   <- st_coordinates(testing(get_rsplit(spatial_folds, 1)))
+test_df_f1$lon <- test_coords[, 1]
+test_df_f1$lat <- test_coords[, 2]
+
+# Best model per family (by mean RMSE from master_leaderboard)
+test_df_f1 <- test_df_f1 %>%
+  mutate(
+    resid_ols = median_house_value - as.vector(fold1_preds$pred_ols),
+    resid_sdm = median_house_value - as.vector(fold1_preds$pred_sdm),
+    resid_slx = median_house_value - as.vector(fold1_preds$pred_slx),
+    resid_rf  = median_house_value - as.vector(fold1_preds$pred_rf)
+  )
+
+resid_limits <- c(-150000, 150000)
+
+make_resid_map <- function(df, resid_col, title) {
+  ggplot(df, aes(x = lon, y = lat, color = .data[[resid_col]])) +
+    geom_point(size = 0.6, alpha = 0.7) +
+    scale_color_gradient2(
+      low = "blue", mid = "white", high = "red", midpoint = 0,
+      limits = resid_limits, oob = scales::squish,
+      name = "Residual\n(USD)"
+    ) +
+    labs(title = title, x = "Longitude", y = "Latitude") +
+    theme_minimal(base_size = 10) +
+    theme(plot.title = element_text(face = "bold", size = 10))
+}
+
+p1 <- make_resid_map(test_df_f1, "resid_ols", "Baseline OLS")
+p2 <- make_resid_map(test_df_f1, "resid_sdm", "Spatial Durbin (SDM)")
+p3 <- make_resid_map(test_df_f1, "resid_slx", "GNPR Hybrid SLX")
+p4 <- make_resid_map(test_df_f1, "resid_rf",  "ML: Random Forest")
+
+(p1 + p2) / (p3 + p4) +
+  plot_annotation(
+    title    = "Spatial Residual Maps — Best Model per Family (Fold 1)",
+    subtitle = "Red = under-prediction · Blue = over-prediction",
+    theme    = theme(plot.title = element_text(face = "bold"))
+  )
+```
+
+The test block corresponds to a Southern California coastal region, represented by the dense cluster of observations in the lower-right portion of each panel. Red shades indicate under-prediction, blue shades indicate over-prediction, and white indicates relatively accurate predictions.
+
+The OLS model exhibits moderate prediction errors distributed throughout the test region, with no strong spatial concentration of residuals. Although the model does not explicitly account for spatial dependence, it captures some of the broad variation in housing prices through the included covariates.
+
+The Spatial Durbin Model (SDM) displays widespread under-prediction across much of the test block, evidenced by the predominance of red residuals. This pattern suggests that the spatial relationships learned during training did not transfer effectively to the geographically distinct holdout region, resulting in systematic prediction bias.
+
+The GNPR Hybrid SLX model produces a more balanced residual pattern, with errors dispersed across the study area and no dominant spatial trend. This indicates that the smooth spatial surface captures important geographic variation while maintaining reasonable predictive performance in unseen regions.
+
+The Random Forest model exhibits the most balanced distribution of under- and over-predictions, with no obvious geographic clustering of residuals. The absence of a strong spatial pattern suggests that the model generalises more effectively across regions and captures a greater proportion of the complex nonlinear relationships present in the data.
+
+
+# Conclusions
+
+## Question 1 — Can nonlinear ensembles predict house prices more accurately?
+
+Yes. The machine learning ensemble models consistently outperformed the traditional parametric approaches under spatial cross-validation. XGBoost achieved the lowest average prediction error, while Random Forest ranked a close second, demonstrating that nonlinear ensemble methods provide the strongest predictive performance for California housing prices.
+
+The improvement in predictive accuracy suggests that housing prices are influenced by complex nonlinear relationships that are not fully captured by linear specifications. The exploratory analysis revealed substantial heterogeneity in housing characteristics across California, while the superior performance of Random Forest and XGBoost indicates that flexible nonlinear models are better able to accommodate interactions, threshold effects, and regional variation in the housing market.
+
+
+## Question 2 - Nonlinear Interactions Between Location and Income
+
+**A. Spatial non-stationarity driven by regional wealth crests**
+
+The interaction is non-linear because a single global coefficient for income fails. The project's Generalized Non-Parametric Regression (GNPR) track proved that an extra unit of `median_income` triggers an exponential, aggressive surge in property values within the narrow coastal strips but completely flattens out into a lower price ceiling when moving inland.
+
+**B. The coastal elongation (spatial anisotropy)** 
+
+The geographic pricing contours stretch diagonally along the coast rather than spreading out symmetrically. This is also supported by the Income-location interaction plot. This structural interaction means that income's impact on house value warps dynamically based on precise coordinate combinations, requiring anisotropic surface math (like a Tensor Product or Varying Coefficient Model) to properly capture the directional price cliffs.
+
+
+## Question 3  — Which model family — parametric regression, generalised nonparametric regression (GNPR), or machine learning — provides the best predictive accuracy?
+
+The machine learning family achieved the strongest predictive performance across the spatial cross-validation framework. XGBoost and Random Forest occupied the top positions in the performance rankings, while the best GNPR models formed an intermediate tier between machine learning and traditional parametric approaches.
+
+Although GNPR models improved substantially upon conventional regression methods by capturing nonlinear spatial relationships, the ensemble machine learning models produced the lowest prediction errors and the most geographically robust performance. These findings suggest that machine learning approaches are the most effective framework for predicting California housing prices within the context of this study, while GNPR models provide a useful compromise between predictive accuracy and interpretability.
